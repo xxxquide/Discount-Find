@@ -24,6 +24,35 @@ MAX_PER_STORE = 5        # максимум позиций одного мага
 MAX_REFERENCE_ITEMS = 2  # сколько «обычных цен» показать, если скидок нет
 
 
+def select_deals(products: list[Product]) -> list[Product]:
+    """
+    Отбирает позиции со скидкой: сортировка по проценту скидки (сначала
+    самые большие), не больше MAX_PER_STORE позиций на один магазин.
+    Используется и текстовым форматтером, и rich-сообщениями.
+    """
+    discounted = sorted(
+        (p for p in products if p.has_discount),
+        key=lambda p: p.discount_pct,
+        reverse=True,
+    )
+    per_store: dict[str, int] = {}
+    selected: list[Product] = []
+    for p in discounted:
+        if per_store.get(p.store_key, 0) >= MAX_PER_STORE:
+            continue
+        per_store[p.store_key] = per_store.get(p.store_key, 0) + 1
+        selected.append(p)
+    return selected
+
+
+def select_reference(products: list[Product]) -> list[Product]:
+    """Пара самых дешёвых обычных цен — «для ориентира», когда скидок нет."""
+    return sorted(
+        (p for p in products if not p.has_discount and p.new_price > 0),
+        key=lambda p: p.new_price,
+    )[:MAX_REFERENCE_ITEMS]
+
+
 def _price(value: float) -> str:
     """32.9 → '32.90' (всегда две цифры после точки, как на ценниках)."""
     return f"{value:.2f}"
@@ -66,21 +95,7 @@ def build_message(
     """
     header = f"🛒 <b>{html.escape(query)}</b>"
 
-    # 1) позиции со скидкой, отсортированные по проценту скидки
-    discounted = sorted(
-        (p for p in products if p.has_discount),
-        key=lambda p: p.discount_pct,
-        reverse=True,
-    )
-
-    # не больше MAX_PER_STORE позиций на магазин
-    per_store_count: dict[str, int] = {}
-    selected: list[Product] = []
-    for p in discounted:
-        if per_store_count.get(p.store_key, 0) >= MAX_PER_STORE:
-            continue
-        per_store_count[p.store_key] = per_store_count.get(p.store_key, 0) + 1
-        selected.append(p)
+    selected = select_deals(products)
 
     parts: list[str] = [header]
 
@@ -89,10 +104,7 @@ def build_message(
     else:
         parts.append("😕 Знижок не знайдено.")
         # покажем пару обычных цен для ориентира (самые дешёвые)
-        reference = sorted(
-            (p for p in products if not p.has_discount and p.new_price > 0),
-            key=lambda p: p.new_price,
-        )[:MAX_REFERENCE_ITEMS]
+        reference = select_reference(products)
         if reference:
             parts.append(
                 "Для орієнтиру, звичайні ціни:\n"
