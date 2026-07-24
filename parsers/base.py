@@ -56,6 +56,7 @@ class Product:
     old_price: float | None # старая цена, грн (None — товар без скидки)
     url: str                # ссылка на товар
     unit: str = ""          # фасовка/единица ('500г', 'шт'), если магазин отдал
+    image_url: str = ""     # ссылка на фото товара (для красивого вывода)
 
     @property
     def has_discount(self) -> bool:
@@ -80,22 +81,45 @@ class Product:
 
 # ── Фильтр релевантности ─────────────────────────────────────────────────────
 
+# Магазины пишут по-разному: «чіпси»/«чипси», «яйця»/«яйца».
+# Приводим украинские/русские варианты букв к одному виду перед сравнением.
+_LETTER_SUBS = str.maketrans({
+    "і": "и", "ї": "и", "є": "е", "ґ": "г", "ё": "е",
+    "'": "", "’": "", "ʼ": "",
+})
+
+
+def _normalize(text: str) -> str:
+    return text.lower().translate(_LETTER_SUBS)
+
+
 def is_relevant(query: str, title: str) -> bool:
     """
-    Проверяем, что товар действительно похож на запрос.
-    Берём значимые слова запроса (от 3 букв), обрезаем окончание
-    (чтобы «макарони» находило и «макаронні вироби») и требуем,
-    чтобы каждое слово встретилось в названии.
+    Проверяем, что товар похож на запрос: каждое значимое слово запроса
+    (от 3 букв, с обрезанным окончанием) должно встретиться в названии.
+    «макарони» → «макаро» найдёт и «Макаронні вироби».
     """
-    title_low = title.lower()
-    words = [w for w in re.split(r"[^\w'’ʼа-яіїєґ]+", query.lower()) if len(w) >= 3]
+    title_norm = _normalize(title)
+    words = [w for w in re.split(r"[^\wа-яіїєґё]+", _normalize(query)) if len(w) >= 3]
     if not words:
         return True
     for word in words:
-        stem = word[: max(4, len(word) - 2)]  # «чіпси» → «чіпс», «макарони» → «макаро»
-        if stem not in title_low:
+        stem = word[: max(4, len(word) - 2)]  # «чипси» → «чипс», «макарони» → «макаро»
+        if stem not in title_norm:
             return False
     return True
+
+
+def apply_relevance(query: str, products: list[Product], fallback_top: int = 10) -> list[Product]:
+    """
+    Оставляет релевантные товары. Если наш фильтр отсеял ВСЁ, а магазин
+    что-то нашёл — доверяем ранжированию магазина и берём верхние позиции
+    (поиск магазина часто умнее простого совпадения букв: синонимы и т.п.).
+    """
+    good = [p for p in products if is_relevant(query, p.title)]
+    if good:
+        return good
+    return products[:fallback_top]
 
 
 # ── Базовый класс парсера ────────────────────────────────────────────────────

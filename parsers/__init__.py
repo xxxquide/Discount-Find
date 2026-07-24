@@ -15,10 +15,10 @@ from .silpo import SilpoParser
 
 # Порядок в этом списке = порядок магазинов в ответе бота
 ALL_PARSER_CLASSES = [
-    SilpoParser,   # этап 1 ✅
-    GroshParser,   # этап 2 ⏳
-    ForaParser,    # этап 3 ⏳
-    AtbParser,     # этап 4 ⏳
+    SilpoParser,   # ✅ внутренний REST API
+    GroshParser,   # ✅ JSON API платформы Salesbox
+    ForaParser,    # ✅ JSON API группы Fozzy
+    AtbParser,     # ✅ HTML со скидочной разметкой (httpx + BeautifulSoup)
 ]
 
 

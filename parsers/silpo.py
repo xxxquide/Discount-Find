@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import httpx
 
-from .base import DEFAULT_HEADERS, REQUEST_TIMEOUT, Product, StoreParser, is_relevant
+from .base import DEFAULT_HEADERS, REQUEST_TIMEOUT, Product, StoreParser, apply_relevance
 
 API_URL = "https://sf-ecom-api.silpo.ua/v1/uk/branches/{branch_id}/products"
 
@@ -26,6 +26,9 @@ API_URL = "https://sf-ecom-api.silpo.ua/v1/uk/branches/{branch_id}/products"
 DEFAULT_BRANCH_ID = "00000000-0000-0000-0000-000000000000"
 
 PRODUCT_URL = "https://silpo.ua/product/{slug}"
+
+# CDN картинок Сільпо: поле icon в ответе — имя файла (проверено, отдаёт 200)
+IMAGE_URL = "https://images.silpo.ua/products/300x300/{icon}"
 
 MAX_RESULTS = 30  # сколько позиций берём из первой страницы результатов
 
@@ -56,15 +59,17 @@ class SilpoParser(StoreParser):
         products: list[Product] = []
         for item in data.get("items", []):
             title = (item.get("title") or "").strip()
-            price = item.get("price")
-            old_price = item.get("oldPrice")
+            # Для весовых товаров price — цена за кг, а displayPrice — цена
+            # за «витринную» единицу (например, за 100 г). Показываем как на сайте.
+            price = item.get("displayPrice") or item.get("price")
+            old_price = item.get("displayOldPrice") or item.get("oldPrice")
+            unit = (item.get("displayRatio") or item.get("ratio") or "").strip()
             slug = item.get("slug") or ""
 
             if not title or not price:
                 continue  # битая позиция — пропускаем
-            if not is_relevant(query, title):
-                continue  # не похоже на то, что искали
 
+            icon = (item.get("icon") or "").strip()
             products.append(
                 Product(
                     store_key=self.key,
@@ -74,7 +79,8 @@ class SilpoParser(StoreParser):
                     new_price=float(price),
                     old_price=float(old_price) if old_price else None,
                     url=PRODUCT_URL.format(slug=slug),
-                    unit=(item.get("ratio") or "").strip(),
+                    unit=unit,
+                    image_url=IMAGE_URL.format(icon=icon) if icon else "",
                 )
             )
-        return products
+        return apply_relevance(query, products)

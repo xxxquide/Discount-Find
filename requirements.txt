@@ -1,5 +1,6 @@
 # Зависимости проекта. Устанавливаются командой:
 #   pip install -r requirements.txt
-aiogram>=3.13,<4        # Telegram-бот (long polling)
+aiogram>=3.30,<4        # Telegram-бот; >=3.30 нужен для Rich Messages (таблицы, коллажи)
 httpx>=0.27             # асинхронные HTTP-запросы к API магазинов
 python-dotenv>=1.0      # чтение настроек из файла .env
+beautifulsoup4>=4.12    # разбор HTML-страницы поиска АТБ
