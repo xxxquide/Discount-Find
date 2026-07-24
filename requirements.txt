@@ -1,0 +1,5 @@
+# Зависимости проекта. Устанавливаются командой:
+#   pip install -r requirements.txt
+aiogram>=3.13,<4        # Telegram-бот (long polling)
+httpx>=0.27             # асинхронные HTTP-запросы к API магазинов
+python-dotenv>=1.0      # чтение настроек из файла .env
