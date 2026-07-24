@@ -1,39 +1,60 @@
 """
 parsers/fora.py — Фора (fora.ua), магазини у Вінниці та Іллінцях.
 
-Внутренний JSON API группы Fozzy, один POST-запрос:
+⚠️ ВАЖНО про акции Фори (это была главная ошибка прошлой версии):
+
+У Фори акции разложены по «наборах» (sets) — это и есть те самые фильтры
+на странице https://fora.ua/all-offers, которые ты видел:
+  «Ще більше знижок», «Лайк Ціна тижня», «Знижки онлайн»,
+  «Завжди свіже», «Гуртова ціна», «Фора охолодила літо», «Власні ТМ»,
+  «Національний Кешбек» и т. д.
+
+Обычный поиск (`customFilter` без набора) ищет по ВСЕМУ каталогу
+и почти не показывает скидки — поэтому бот находил всего пару позиций.
+Правильный путь: передавать `sets: ["<id набору>"]`, и тогда приходят
+именно акционные товары этого набора. Один и тот же товар может быть
+в нескольких наборах — дубликаты убираем.
+
+Полный список наборов магазина берём из GetPromotionCollection
+(поля items + skuSets) — он свой для каждого филиала.
+
+Точки входа:
   POST https://api.catalog.ecom.fora.ua/api/2.0/exec/EcomCatalogGlobal
-  {"method": "GetSimpleCatalogItems",
-   "data": {"merchantId": 2, "filialId": <магазин>, "customFilter": "<запрос>", …}}
+    GetPromotionCollection — какие акции/наборы есть у магазина
+    GetSimpleCatalogItems  — товары: набор (sets) и/или текст (customFilter)
+    GetPickupFilials       — магазины города (businessId=4)
 
-filialId — конкретный магазин (см. region.py):
-  3745 — Вінниця, вул. Чорновола В'ячеслава, 29Б
-  4142 — Іллінці, вул. Європейська, 22 (у Фори записан как «Маркса Карла, 22»)
-
-Раньше использовался филиал 310 (Київ) — цены и ассортимент были чужие.
-
-Список магазинов любого города можно получить так:
-  {"method":"GetPickupFilials","data":{"merchantId":2,"businessId":4,"city":"м. Вінниця"}}
+Филиалы (region.py): 3745 — Вінниця, Чорновола 29Б; 4142 — Іллінці.
 """
 from __future__ import annotations
+
+import asyncio
+import logging
 
 import httpx
 
 from region import FORA_BUSINESS_ID, FORA_DEFAULT_FILIAL, FORA_MERCHANT_ID
 from .base import DEFAULT_HEADERS, REQUEST_TIMEOUT, Product, StoreParser, apply_relevance
 
+logger = logging.getLogger(__name__)
+
 API_URL = "https://api.catalog.ecom.fora.ua/api/2.0/exec/EcomCatalogGlobal"
 PRODUCT_URL = "https://fora.ua/product/{slug}"
 
-DELIVERY_TYPE = 1       # самовивіз — ассортимент конкретного магазина
-MAX_RESULTS = 30
-DEALS_PAGE_SIZE = 100
-MAX_DEALS_PAGES = 5
+DELIVERY_TYPE = 1        # самовивіз — ассортимент конкретного магазина
+MAX_RESULTS = 50         # позиций на один запрос поиска
+SET_PAGE_SIZE = 100      # позиций за одну страницу набора
+MAX_PAGES_PER_SET = 3    # не больше 3 страниц на набор (300 позиций)
+SEARCH_BATCH = 4         # сколько наборов опрашиваем одновременно при поиске
+DEALS_BATCH = 3          # сколько наборов одновременно при сборе каталога
+
+# Наборы, которые точно не про скидки (сервисные/тематические без цен)
+SKIP_SETS = {"fora-recommends"}
 
 HEADERS = dict(
     DEFAULT_HEADERS,
     Origin="https://fora.ua",
-    Referer="https://fora.ua/",
+    Referer="https://fora.ua/all-offers",
 )
 
 
@@ -47,6 +68,19 @@ class ForaParser(StoreParser):
     def __init__(self, filial_id: str | None = None) -> None:
         super().__init__()
         self.filial_id = int(filial_id or FORA_DEFAULT_FILIAL)
+        self._sets_cache: list[str] | None = None
+
+    # ── низкоуровневый вызов API ────────────────────────────────────────
+    async def _call(self, method: str, data: dict) -> dict:
+        body = {"method": method, "data": {"merchantId": FORA_MERCHANT_ID, **data}}
+        async with httpx.AsyncClient(headers=HEADERS, timeout=REQUEST_TIMEOUT) as client:
+            response = await client.post(API_URL, json=body)
+            response.raise_for_status()
+            payload = response.json()
+        error = payload.get("EComError") or {}
+        if error.get("ErrorCode") not in (0, None):
+            raise RuntimeError(f"Fora API: {error.get('ErrorMessage')}")
+        return payload
 
     def _to_product(self, item: dict) -> Product | None:
         name = (item.get("name") or "").strip()
@@ -67,77 +101,129 @@ class ForaParser(StoreParser):
             image_url=item.get("mainImage") or "",
         )
 
-    async def _call(self, method: str, data: dict) -> dict:
-        body = {"method": method, "data": {"merchantId": FORA_MERCHANT_ID, **data}}
-        async with httpx.AsyncClient(headers=HEADERS, timeout=REQUEST_TIMEOUT) as client:
-            response = await client.post(API_URL, json=body)
-            response.raise_for_status()
-            payload = response.json()
-        error = payload.get("EComError") or {}
-        if error.get("ErrorCode") not in (0, None):
-            raise RuntimeError(f"Fora API: {error.get('ErrorMessage')}")
-        return payload
+    # ── список акционных наборов магазина ───────────────────────────────
+    async def _promo_sets(self) -> list[str]:
+        """
+        Все наборы акций нашего магазина (кэшируем на время работы бота).
+        Это те самые фильтры «Акції» со страницы all-offers.
+        """
+        if self._sets_cache is not None:
+            return self._sets_cache
 
+        payload = await self._call("GetPromotionCollection", {
+            "deliveryType": DELIVERY_TYPE,
+            "filialId": self.filial_id,
+        })
+        ids: list[str] = []
+        # items — промо-акции, skuSets — товарные наборы; нужны и те, и те
+        for group in ("items", "skuSets"):
+            for entry in (payload.get(group) or []):
+                set_id = entry.get("id")
+                if set_id and set_id not in ids and set_id not in SKIP_SETS:
+                    ids.append(set_id)
+
+        # исторически полезные наборы, которых иногда нет в ответе
+        for extra in ("do-70-na-vlasni-marky", "znyzhky-onlain", "laik_tsina"):
+            if extra not in ids:
+                ids.append(extra)
+
+        self._sets_cache = ids
+        logger.info("Фора: знайдено %d наборів акцій", len(ids))
+        return ids
+
+    # ── поиск товара ────────────────────────────────────────────────────
     async def _search_once(self, query: str) -> list[Product]:
-        payload = await self._call("GetSimpleCatalogItems", {
-            "customFilter": query,
-            "deliveryType": DELIVERY_TYPE,
-            "filialId": self.filial_id,
-            "From": 1,
-            "To": MAX_RESULTS,
-        })
-        products = [p for p in (self._to_product(i) for i in (payload.get("items") or [])) if p]
-        return apply_relevance(query, products)
-
-    async def fetch_all_deals(self, max_items: int = 300) -> list[Product]:
         """
-        Все акции нашего магазина.
-
-        Особенность Фори: запрос с пустым фильтром отдаёт ВЕСЬ каталог
-        (7000+ позиций, скидочных среди первых почти нет). Зато есть
-        метод GetPromoFilters — он возвращает категории именно акционных
-        товаров (это и есть раздел «Акції» на сайте). Поэтому идём так:
-        берём список акционных категорий и обходим их по очереди.
+        Ищем товар в акционных наборах (там живут скидки) И в общем каталоге
+        (чтобы знать обычную цену, если акции нет).
         """
-        collected: list[Product] = []
-        seen: set[str] = set()
+        sets = await self._promo_sets()
+        found: dict[str, Product] = {}
 
-        # 1) какие категории есть в разделе акций
-        await self._wait_turn()
-        filters = await self._call("GetPromoFilters", {
-            "deliveryType": DELIVERY_TYPE,
-            "filialId": self.filial_id,
-        })
-        categories: list[str] = []
-        for f in (filters.get("filters") or []):
-            if f.get("typeId") == 3:      # тип 3 = категории товаров
-                for item in ((f.get("props") or {}).get("items") or []):
-                    if item.get("id"):
-                        categories.append(str(item["id"]))
-        if not categories:
-            return []
-
-        # 2) обходим категории (самые крупные идут первыми)
-        for category_id in categories[:MAX_DEALS_PAGES * 2]:
-            if len(collected) >= max_items:
-                break
-            await self._wait_turn()
-            payload = await self._call("GetSimpleCatalogItems", {
-                "customFilter": "",
+        async def query_set(set_id: str | None) -> list[dict]:
+            """Один запрос: с набором (акции) или без (общий каталог)."""
+            data = {
+                "customFilter": query,
                 "deliveryType": DELIVERY_TYPE,
                 "filialId": self.filial_id,
-                "categoryId": category_id,
-                "From": 1,
-                "To": DEALS_PAGE_SIZE,
-            })
-            for raw in (payload.get("items") or []):
-                product = self._to_product(raw)
-                if product and product.has_discount and product.url not in seen:
-                    seen.add(product.url)
-                    collected.append(product)
-        return collected[:max_items]
+                "from": 1, "to": MAX_RESULTS,
+                "From": 1, "To": MAX_RESULTS,
+            }
+            if set_id:
+                data["sets"] = [set_id]
+            try:
+                payload = await self._call("GetSimpleCatalogItems", data)
+                return payload.get("items") or []
+            except Exception as e:  # noqa: BLE001 — один набор не критичен
+                logger.debug("Фора: набір %s не відповів (%s)", set_id, e)
+                return []
 
-    # ── справочник магазинов (для настроек бота) ────────────────────────
+        # Запросы к наборам идут пачками по SEARCH_BATCH — так поиск
+        # занимает секунды, а не минуту, но сайт не заваливаем.
+        targets: list[str | None] = [None] + list(sets)   # None = общий каталог
+        for i in range(0, len(targets), SEARCH_BATCH):
+            batch = targets[i:i + SEARCH_BATCH]
+            await self._wait_turn()
+            for items in await asyncio.gather(*(query_set(s) for s in batch)):
+                for raw in items:
+                    product = self._to_product(raw)
+                    if product and product.url not in found:
+                        found[product.url] = product
+
+        return apply_relevance(query, list(found.values()))
+
+    # ── весь каталог акций ──────────────────────────────────────────────
+    async def fetch_all_deals(self, max_items: int = 400) -> list[Product]:
+        """
+        Все акции магазина: обходим ВСЕ акционные наборы (те самые фильтры
+        со страницы all-offers) и собираем позиции со скидкой.
+        """
+        sets = await self._promo_sets()
+        collected: dict[str, Product] = {}
+
+        async def fetch_set(set_id: str) -> list[Product]:
+            """Все страницы одного набора."""
+            out: list[Product] = []
+            for page in range(MAX_PAGES_PER_SET):
+                try:
+                    payload = await self._call("GetSimpleCatalogItems", {
+                        "customFilter": "",
+                        "deliveryType": DELIVERY_TYPE,
+                        "filialId": self.filial_id,
+                        "sets": [set_id],
+                        "from": page * SET_PAGE_SIZE + 1,
+                        "to": (page + 1) * SET_PAGE_SIZE,
+                        "From": page * SET_PAGE_SIZE + 1,
+                        "To": (page + 1) * SET_PAGE_SIZE,
+                    })
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("Фора: набір %s стор. %d — %s", set_id, page, e)
+                    break
+                items = payload.get("items") or []
+                if not items:
+                    break
+                for raw in items:
+                    product = self._to_product(raw)
+                    if product and product.has_discount:
+                        out.append(product)
+                if len(items) < SET_PAGE_SIZE:   # набор закончился
+                    break
+            return out
+
+        # наборы обходим пачками — быстро, но без спама
+        for i in range(0, len(sets), DEALS_BATCH):
+            if len(collected) >= max_items:
+                break
+            batch = sets[i:i + DEALS_BATCH]
+            await self._wait_turn()
+            for products in await asyncio.gather(*(fetch_set(s) for s in batch)):
+                for product in products:
+                    if product.url not in collected:
+                        collected[product.url] = product
+
+        return list(collected.values())[:max_items]
+
+    # ── справочник магазинов (для настроек) ─────────────────────────────
     @staticmethod
     async def list_stores(city: str) -> list[dict]:
         """Магазины Фори в городе, например city='м. Вінниця'."""
