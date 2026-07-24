@@ -1,0 +1,13 @@
+# Секреты — НИКОГДА не попадают в git
+.env
+
+# Локальные данные бота
+cache.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# macOS
+.DS_Store
