@@ -130,7 +130,8 @@ class StoreParser(ABC):
     key: str = ""
     name: str = ""
     emoji: str = ""
-    enabled: bool = True  # выключенный магазин просто не участвует в поиске
+    enabled: bool = True             # выключенный магазин не участвует в поиске
+    supports_deals_catalog: bool = False  # умеет ли отдавать весь каталог акций
 
     def __init__(self) -> None:
         # Замок гарантирует: к одному магазину запросы идут строго по очереди,
@@ -150,6 +151,14 @@ class StoreParser(ABC):
     @abstractmethod
     async def _search_once(self, query: str) -> list[Product]:
         """Ровно один поисковый запрос к магазину. Реализуется в наследнике."""
+
+    async def fetch_all_deals(self, max_items: int = 300) -> list[Product]:
+        """
+        Весь каталог акций магазина (для локального индекса и раздела
+        «всі акції»). Переопределяется в наследниках, у которых
+        supports_deals_catalog = True.
+        """
+        raise NotImplementedError(f"{self.name} не вміє віддавати каталог акцій")
 
     async def search(self, query: str) -> list[Product]:
         """
